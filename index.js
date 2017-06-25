@@ -9,6 +9,11 @@ const partialRight = require('lodash.partialright')
 const mkdirp = require('mkdirp')
 const unzip = require('unzip-wrapper')
 const TEMP_DIR = path.join(require('os').tmpdir(), 'bandcamp')
+const promisify = fn => (...args) => new Promise((s,f) =>
+    fn(...args, err => err ? f(err) : s()))
+
+const mkdirpAsync = promisify(mkdirp)
+const unzipAsync = promisify(unzip)
 
 const bandCampUrl = 'https://bandcamp.com/login'
 const bandCampLogoutUrl = 'https://bandcamp.com/logout'
@@ -18,16 +23,56 @@ const submitButtonSelector = '#submit'
 const downloadItemLinkSelectors = '.collection-item-container > div.collection-item-details-container > span.redownload-item > a'
 const downloadButtonSelector = 'div.download-rightcol > .downloadStatus > .downloadGo'
 
-var options = {
+const options = {
     show: process.env['NB_SHOW'] || false,
-    format: 'mp3-320', //todo expose, collect available and fallback with highest possible
+    format: 'Ogg Vorbis', //todo expose, collect available and fallback with highest possible
     concurrent: process.env['NB_CONBURRENT'] || 1,
     username: process.env['NB_USER'],
     password: process.env['NB_PASS'],
     destination: process.env['NB_DEST'],
 }
 
-downloadCollection(options)
+if (!options.destination) {
+    options.destination = path.join(process.cwd(), 'downloads')
+    console.log('To download to a custom location use "NB_DEST" ENV variable to set the destination')
+}
+options.unzipDestination = path.join(options.destination, 'music')
+options.zipDestination = path.join(options.destination, 'zips')
+
+mkdirp.sync(options.zipDestination)
+mkdirp.sync(options.unzipDestination)
+mkdirp.sync(TEMP_DIR)
+
+console.log(`Download temp dir ${TEMP_DIR}`)
+console.log(`Downloading music to ${options.destination}`)
+console.log(`Logging in as user ${options.username}`)
+
+new Nightmare(options)
+    .use(nightmare => nightmare
+        .goto(bandCampLogoutUrl)
+        .goto(bandCampUrl)
+        .type(usernameInputSelector, '')
+        .type(usernameInputSelector, options.username)
+        .type(passwordInputSelector, '')
+        .type(passwordInputSelector, options.password)
+        .click(submitButtonSelector)
+        .wait())
+    .wait('#collection-container')
+    .use(nightmare => nightmare.evaluate(() => {
+        const links = document.querySelectorAll(downloadItemLinkSelectors)
+        return Array.prototype.map.call(links, link => link.href)
+    }))
+    .end()
+    .then(urls => {
+        console.log(`Found ${urls.length} to download`)
+        return urls
+    })
+    .then(urls => {
+        console.log(`About to download ${urls.length} albums, ${options.concurrent} at a time`)
+        
+        const tasks = urls.map(url => () => downloadAlbum(url))
+        return sequences.seriesSettled(tasks, options.concurrent)
+    })
     .then((result) => {
         console.log('\\m/ your bandcamp collection is now downloaded, keep it growing!')
         console.log(result)
@@ -39,171 +84,65 @@ downloadCollection(options)
         process.exit(1)
     })
 
-function downloadCollection(options) {
-    options = validateDownloadDestination(options)
+const downloadAlbum = url => getAlbumDownloadLink(url)
+    .then(downloadBandcampZip)
+    .then(unzipMusic)
 
-    return getCollectionDownloadPageUrls(options)
-        .then(logPagesProgress)
-        .then(partialRight(downloadAlbumUrls, options))
+const unzipMusic = zipResult => {
+    const target = path.join(options.unzipDestination, zipResult.musicName)
+
+    return mkdirpAsync(target)
+        .then(() => unzipAsync(zipResult.zipPath, { target, fix: true }))
+        .then(() => console.log(`Unzipping ${target} done!`))
 }
 
-function validateDownloadDestination(options) {
-    if (typeof options.destination === 'undefined') {
-        options.destination = path.join(process.cwd(), 'downloads')
-        console.log('To download to a custom location use "NB_DEST" ENV variable to set the destination')
-    }
-    options.unzipDestination = path.join(options.destination, 'music')
-    options.zipDestination = path.join(options.destination, 'zips')
-
-    mkdirp.sync(options.zipDestination)
-    mkdirp.sync(options.unzipDestination)
-    mkdirp.sync(TEMP_DIR)
-
-    console.log(`Download temp dir ${TEMP_DIR}`)
-    console.log(`Downloading music to ${options.destination}`)
-
-    return options
-}
-
-function getCollectionDownloadPageUrls(options) {
-    console.log(`Logging in as user ${options.username}`)
-
-    return new Nightmare(options)
-        .use(login(options.username, options.password))
-        .wait('#collection-container')
-        .use(getMusicDownloadPageUrls(downloadItemLinkSelectors))
-        .end()
-}
-
-function login(username, password) {
-    return (nightmare) => {
-        nightmare
-            .goto(bandCampLogoutUrl)
-            .goto(bandCampUrl)
-            .type(usernameInputSelector, '')
-            .type(usernameInputSelector, username)
-            .type(passwordInputSelector, '')
-            .type(passwordInputSelector, password)
-            .click(submitButtonSelector)
-            .wait()
-    }
-}
-
-function getMusicDownloadPageUrls(downloadItemLinkSelectors) {
-    return nightmare => {
-        nightmare.evaluate(evaluateDownloadItemLinks, downloadItemLinkSelectors)
-    }
-
-    function evaluateDownloadItemLinks(downloadItemLinkSelectors) {
-        var links = document.querySelectorAll(downloadItemLinkSelectors)
-        var linkHrefs = Array.prototype.map.call(links, link => link.href)
-        return linkHrefs
-    }
-}
-
-function logPagesProgress(urls) {
-    console.log(`Found ${urls.length} to download`)
-    return Promise.resolve(urls)
-}
-
-function downloadAlbumUrls(urls, options) {
-    console.log(`About to download ${urls.length} albums, ${options.concurrent} at a time`)
-    
-    var tasks = urls.map(url => downloadAlbum.bind(undefined, url, options))
-    return sequences.seriesSettled(tasks, options.concurrent)
-}
-
-function downloadAlbum(url, options) {
-    return getAlbumDownloadLink(url, options)
-        .then(partialRight(downloadBandcampZip, options))
-        .then(partialRight(unzipMusic, options))
-}
-
-function unzipMusic(zipResult, options) {
-    return new Promise((resolve, reject) => {
-        var unzipDestination = path.join(options.unzipDestination, zipResult.musicName)
-        var unzipOptions = {
-            fix: true,
-            target: unzipDestination,
-        }
-        mkdirp(unzipDestination, unzipMusic)
-
-        function unzipMusic(err) {
-            if (err) reject(err)
-
-            unzip(zipResult.zipPath, unzipOptions, (err) => {
-                if (err) reject(err)
-                console.log(`Unzipping ${unzipDestination} done!`)
-                resolve()
-            })
-        }
-    })
-}
-
-function getAlbumDownloadLink(url, options) {
-    return new Nightmare(options)
-        .useragent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.110 Safari/537.36")
-        .goto(url)
-        .wait(downloadButtonSelector)
-        .wait(1000)
-        .click('#downloadFormatMenu0')
-        .wait('#formatMenu2')
-        .wait(downloadButtonSelector)
-        .wait(2000)
-        .evaluate(clickMusicFormat, options.format)
-        .wait(2000)
-        .wait(downloadButtonSelector)
-        .evaluate(getDownloadUrl, downloadButtonSelector)
-        .end()
-
-    function getDownloadUrl(downloadButtonSelector) {
-        return document.querySelector(downloadButtonSelector).href
-    }
-
-    function clickMusicFormat(format) {
+const getAlbumDownloadLink = (url, options) => new Nightmare(options)
+    .useragent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/49.0.2623.110 Safari/537.36")
+    .goto(url)
+    .wait(downloadButtonSelector)
+    .wait(1000)
+    .click('#downloadFormatMenu0')
+    .wait('#formatMenu2')
+    .wait(downloadButtonSelector)
+    .wait(2000)
+    .evaluate(format => {
         // something fishy about the bandcamp site requires the mouseenter
         $(`.ui-menu-item[data-value=${format}]`).trigger('mouseenter')
         $(`.ui-menu-item[data-value=${format}]`).click()
-    }
-}
+    }, options.format)
+    .wait(2000)
+    .wait(downloadButtonSelector)
+    .evaluate(query => document.querySelector(query).href, downloadButtonSelector)
+    .end()
 
-function downloadBandcampZip(musicLink, options) {
-    return new Promise((resolve, reject) => {
-        var downloadFileName = path.join(TEMP_DIR, (new Date().getTime()) + '.zip')
-        var progressStreamOptions = {time: 1000}
-        var progressStream = progress(progressStreamOptions)
-            .on('progress', progress => console.log(`downloaded ${Math.round(progress.percentage)}% of ${musicLink}`))
-            .on('finish', onStreamFinish)
-        var musicName = `download-${new Date().getTime()}`
+const downloadBandcampZip = (musicLink, options) => new Promise((s, f) => {
+    let musicName = `download-${Date.now()}`
+    const downloadFileName = path.join(TEMP_DIR, (new Date().getTime()) + '.zip')
+    const progressStream = progress({time: 1000})
+        .on('progress', progress => console.log(`downloaded ${Math.round(progress.percentage)}% of ${musicLink}`))
+        .on('finish', () => {
+            const zipFileName = musicName + '.zip'
+            const zipPath = path.join(options.zipDestination, zipFileName)
+            fs.rename(downloadFileName, zipPath, () =>
+                s({ zipFileName, musicName, zipPath }))
+        })
 
-        request
-            .get(musicLink)
-            .on('error', reject)
-            .on('response', onResponse)
-            .pipe(progressStream)
-            .pipe(fs.createWriteStream(downloadFileName))
-
-        function onResponse(response) {
+    request
+        .get(musicLink)
+        .on('error', f)
+        .on('response', response => {
             progressStream.setLength(response.headers['content-length'])
-            var contentDisposition = response.headers['content-disposition']
+            const contentDisposition = response.headers['content-disposition']
             console.log(`Downloading zip file ${filesize(response.headers['content-length'])}`)
 
-            if (typeof contentDisposition !== 'undefined') {
-                var fileNameMatch = /(?:filename\*=UTF-8'')(.*)(?:.zip)/.exec(contentDisposition)
-                if (fileNameMatch[1]) {
-                    musicName = `${decodeURIComponent(fileNameMatch[1])}`
-                    return
+            if (contentDisposition !== undefined) {
+                const fileNameMatch = /(?:filename\*=UTF-8'')(.*)(?:.zip)/.exec(contentDisposition)
+                if (!fileNameMatch[1]) {
+                    return console.error('unable to determine filename from the response headers')
                 }
+                musicName = `${decodeURIComponent(fileNameMatch[1])}`
             }
-            console.error('unable to determine filename from the response headers')
-        }
-
-        function onStreamFinish() {
-            var zipFileName = musicName + '.zip'
-            zipPath = path.join(options.zipDestination, zipFileName)
-            fs.rename(downloadFileName, zipPath, () => resolve({
-                zipFileName, musicName, zipPath
-            }))
-        }
-    })
-}
+        })
+        .pipe(progressStream)
+        .pipe(fs.createWriteStream(downloadFileName))
+})
